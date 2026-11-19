@@ -881,6 +881,9 @@ class InvokeSubgraphCache(HopSubgraphCache):
         self.subgraph_reuse_key_cache: dict[
             CodeType, dict[int, InvokeSubgraphReuseEntry]
         ] = defaultdict(dict)
+        # (identifier, autocast state) -> identifier emitted for calls under that
+        # state in pre-dispatch tracing.
+        self.autocast_variants: dict[tuple[str, object], str] = {}
 
     def add_dynamo_installed_submodule(
         self, fn_code: CodeType, identifier: str
@@ -901,6 +904,46 @@ class InvokeSubgraphCache(HopSubgraphCache):
 
     def get_proxy_dispatch_entry(self, identifier: str) -> Callable | None:
         return self.proxy_dispatch_cache.get(identifier, None)
+
+    def identifiers_in_use(self) -> set[str]:
+        """Return every identifier that this cache stores an entry under."""
+        used = set(self.autograd_cache)
+        used.update(self.proxy_dispatch_cache, self.lazy_bwd_cache, self.effects_cache)
+        used.update(self.autocast_variants.values())
+        for identifiers in self.dynamo_installed_submodules.values():
+            used.update(identifiers)
+        # Schema keys are (id(subgraph), identifier, operand types).
+        used.update(
+            key[1] for key in self.functionalize_schema_cache if isinstance(key, tuple)
+        )
+        return used
+
+    def add_autocast_variant(self, identifier: str, autocast_state: object) -> str:
+        """Return the identifier to emit for a call under this autocast state.
+
+        Each (identifier, autocast state) pair gets its own identifier. It is the
+        given one if no other pair uses it yet, else the given one with the
+        first "_autocast_<n>" suffix that no other region uses. Exported
+        programs keep these names, so a traced program can already use such a
+        name for another region.
+        """
+        key = (identifier, autocast_state)
+        if key not in self.autocast_variants:
+            used = set(self.autocast_variants.values())
+            variant, index = identifier, 0
+            if variant in used:
+                # Earlier passes, such as the AOTAutograd metadata pass, cache
+                # every region under its identifier, so a suffixed name found
+                # there can belong to another region.
+                used = self.identifiers_in_use()
+            while variant in used:
+                index += 1
+                variant = f"{identifier}_autocast_{index}"
+            self.autocast_variants[key] = variant
+            # Effects are found per region, so the new identifier has the same ones.
+            if variant != identifier and (effects := self.get_effects(identifier)):
+                self.add_effects(variant, effects)
+        return self.autocast_variants[key]
 
     def add_functionalize_schema_entry(
         self, key: object, schema: torch._C.FunctionSchema

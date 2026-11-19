@@ -33,6 +33,7 @@ from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class
 from torch._ops import HigherOrderOperator
 from torch._subclasses.functional_tensor import disable_functional_mode
+from torch.amp.autocast_mode import _autocast_state
 from torch.fx.experimental.proxy_tensor import (
     disable_proxy_modes_tracing,
     ProxyTorchDispatchMode,
@@ -1324,9 +1325,20 @@ def _(subgraph, identifier, *operands):
 
 @invoke_subgraph.py_impl(ProxyTorchDispatchMode)
 def _(proxy_mode: ProxyTorchDispatchMode, subgraph, identifier, *operands):
+    invoke_subgraph_cache = get_invoke_subgraph_cache()
+    if invoke_subgraph_cache and proxy_mode.pre_dispatch:
+        # The traced subgraph and its outputs depend on the autocast state. A
+        # separate identifier per state keeps the calls apart in the caches used
+        # from here on and in later passes, which key on the identifier. Other
+        # tracing, such as torch.compile with its usual backends, also reuses
+        # one identifier across autocast states, but it keys its autograd caches
+        # on the identifier before this point, so renaming here would not fix it.
+        identifier = invoke_subgraph_cache.add_autocast_variant(
+            identifier, _autocast_state()
+        )
+
     # Check if we have already traced the subgraph.
     graph = None
-    invoke_subgraph_cache = get_invoke_subgraph_cache()
     if invoke_subgraph_cache:
         graph = invoke_subgraph_cache.get_proxy_dispatch_entry(identifier)
 
