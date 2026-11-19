@@ -223,14 +223,18 @@ def forward(self, a_1):
         # Strict export traces _enter_autocast from a Dynamo graph, which has no
         # finally block to exit it when the traced code raises.
         def raise_in_open_autocast():
-            torch.amp.autocast_mode._enter_autocast("cpu", torch.float16, True, None)
+            # A disabled CUDA autocast still sets the CUDA dtype, also without a GPU.
+            torch.amp.autocast_mode._enter_autocast("cuda", torch.float16, False, None)
+            torch.amp.autocast_mode._enter_autocast("cpu", torch.bfloat16, True, None)
             raise RuntimeError("error inside autocast")
 
         def alone(x):
             raise_in_open_autocast()
 
         def inside_with(x):
-            with torch.autocast("cpu", dtype=torch.float16):
+            # A dtype other than the start one, so that a cleanup that restores
+            # the state saved when the inner autocast was entered fails.
+            with torch.autocast("cpu", dtype=torch.bfloat16):
                 raise_in_open_autocast()
 
         def two_open(x):
@@ -246,18 +250,26 @@ def forward(self, a_1):
         before = _snapshot_autocast_state()
         self.addCleanup(_restore_autocast_state, before)
 
-        for f, error, message in (
-            (alone, RuntimeError, "error inside autocast"),
-            (inside_with, RuntimeError, "error inside autocast"),
-            (two_open, RuntimeError, "error inside autocast"),
-            (exit_out_of_order, AssertionError, "must exit the latest"),
-        ):
-            with self.subTest(f.__name__):
-                with self.assertRaisesRegex(error, message):
-                    make_fx(f, pre_dispatch=True, tracing_mode=self.tracing_mode)(
-                        torch.randn(2)
-                    )
-                self.assertEqual(_snapshot_autocast_state(), before)
+        # Start from dtypes other than the defaults, with autocast on and off, so
+        # that a cleanup that resets the enabled flag or a dtype fails.
+        for enabled in (True, False):
+            with (
+                torch.autocast("cpu", dtype=torch.float16, enabled=enabled),
+                torch.autocast("cuda", dtype=torch.bfloat16, enabled=False),
+            ):
+                start = _snapshot_autocast_state()
+                for f, error, message in (
+                    (alone, RuntimeError, "error inside autocast"),
+                    (inside_with, RuntimeError, "error inside autocast"),
+                    (two_open, RuntimeError, "error inside autocast"),
+                    (exit_out_of_order, AssertionError, "must exit the latest"),
+                ):
+                    with self.subTest(f.__name__, enabled=enabled):
+                        with self.assertRaisesRegex(error, message):
+                            make_fx(
+                                f, pre_dispatch=True, tracing_mode=self.tracing_mode
+                            )(torch.randn(2))
+                        self.assertEqual(_snapshot_autocast_state(), start)
 
     @unittest.skipIf(not torch._dynamo.is_dynamo_supported(), "Cond requires dynamo")
     def test_pre_dispatch_autocast_across_cond(self):
@@ -289,8 +301,12 @@ def forward(self, a_1):
             inner.append(make_fx(g, pre_dispatch=True)(torch.randn(2, 2)))
             return x + 1
 
-        make_fx(f, pre_dispatch=True, tracing_mode=self.tracing_mode)(torch.randn(2, 2))
+        outer = make_fx(f, pre_dispatch=True, tracing_mode=self.tracing_mode)(
+            torch.randn(2, 2)
+        )
         self.assertEqual(inner[0](torch.randn(2, 2)).dtype, torch.bfloat16)
+        autocast_fns = (torch.amp.autocast_mode._enter_autocast, torch.amp.autocast_mode._exit_autocast)
+        self.assertFalse(any(n.target in autocast_fns for n in outer.graph.nodes))
 
     def test_make_fx_simple(self):
         def f(x):
@@ -946,6 +962,39 @@ class TestRealProxyTensor(TestCase):
             "torch_fn" not in n.meta for n in gm_without.graph.nodes if n.op == "call_function"
         )
         self.assertTrue(torch_fn_absent, "torch_fn metadata should be absent when mode is disabled")
+
+    def test_pre_dispatch_autocast_replay_keeps_cast_cache_off(self):
+        # A weight cast cached while tracing would become a constant of a later
+        # trace inside the same outer autocast. The node must also keep the
+        # omitted dtype, which follows the autocast state when the graph runs.
+        def f(x, w):
+            ctx = torch.amp.autocast_mode._enter_autocast("cpu", None, True, True)
+            y = torch.mm(x, w)
+            torch.amp.autocast_mode._exit_autocast(ctx)
+            return y
+
+        x = torch.randn(2, 4)
+        w = nn.Parameter(torch.randn(4, 4))
+        other = nn.Parameter(torch.randn(4, 4))
+        with torch.autocast("cpu", dtype=torch.bfloat16, cache_enabled=True):
+            pre = make_fx(f, pre_dispatch=True)(x, w)
+            post = make_fx(pre)(x, w)
+        (enter,) = pre.graph.find_nodes(op="call_function", target=torch.amp.autocast_mode._enter_autocast)
+        self.assertEqual(enter.args, ("cpu", None, True, True))
+        self.assertEqual(post(x, other), f(x, other))
+
+    @unittest.skipIf(not torch._dynamo.is_dynamo_supported(), "Strict export requires dynamo")
+    def test_pre_dispatch_autocast_replay_warns_once(self):
+        # Dynamo warns about the unsupported dtype, and the replay must not warn again.
+        class M(torch.nn.Module):
+            def forward(self, x):
+                with torch.autocast("cpu", dtype=torch.float64):
+                    return x.mm(x)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.export.export(M(), (torch.randn(2, 2),), strict=True)
+        self.assertEqual(sum("Disabling autocast" in str(w.message) for w in caught), 1)
 
 class TestFakeProxyTensor(TestCase):
     hw_classification = HardwareClassification.GENERIC
