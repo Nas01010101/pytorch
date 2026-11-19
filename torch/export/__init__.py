@@ -391,7 +391,9 @@ def load(
     This is not a safety guarantee: as the warning above says, load unpickles
     data, and other parts of the file, such as the specs of the program's
     inputs and outputs or the inputs of other higher order ops, can import
-    modules too.
+    modules too. When load raises its generic ``RuntimeError`` for a file it
+    cannot read, the first error, such as a name that is not found, is its
+    ``__cause__``.
 
     Args:
         f (str | os.PathLike[str] | IO[bytes]): A file-like object (has to

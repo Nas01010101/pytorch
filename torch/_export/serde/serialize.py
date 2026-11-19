@@ -743,7 +743,7 @@ def _find_imported(name: str) -> Any:
     # and any attribute read on a lazily loaded module loads it. isinstance
     # can read __class__ too. So lookups are static, types are checked with
     # issubclass(type(obj), ...), and only classes and functions are read
-    # further.
+    # further, which can run metaclass code of a class that is imported.
     module = sys.modules.get(module_name)
     if module is None:
         # A local or nested class has a qualified name that is not a module
@@ -771,7 +771,7 @@ def _find_imported(name: str) -> Any:
         raise SerializeError(
             f"{name} cannot be found: module {module_name} has no attribute {attr}"
         )
-    if not issubclass(type(obj), (type, types.FunctionType, types.BuiltinFunctionType)):
+    if not issubclass(type(obj), (type, types.FunctionType)):
         raise SerializeError(f"{name} is not a class or function")
     return obj
 
@@ -834,7 +834,11 @@ def _same_value(a: Any, b: Any) -> bool:
             for (ka, va), (kb, vb) in zip(a.items(), b.items())
         )
     if isinstance(a, (list, tuple, deque)):
-        return len(a) == len(b) and all(map(_same_value, a, b))
+        return (
+            len(a) == len(b)
+            and getattr(a, "maxlen", None) == getattr(b, "maxlen", None)
+            and all(map(_same_value, a, b))
+        )
     if isinstance(a, (set, frozenset)):
         return len(a) == len(b) and all(any(_same_value(x, y) for y in b) for x in a)
     # A NaN does not equal itself, so it is refused. JSON loads every NaN as
@@ -920,10 +924,10 @@ def _check_autograd_function(name: Any) -> None:
         and issubclass(function_cls, torch.autograd.Function)
     ):
         raise SerializeError(f"{name} is not a torch.autograd.Function")
+    # apply is a classmethod, so the mark is on the function inside it.
     if not any(
-        _is_allowed_in_pre_dispatch_graph(
-            getattr(vars(c).get("apply"), "__func__", None)
-        )
+        type(apply := vars(c).get("apply")) is classmethod
+        and _is_allowed_in_pre_dispatch_graph(apply.__func__)
         for c in function_cls.__mro__
     ):
         raise SerializeError(
@@ -1505,6 +1509,17 @@ class GraphModuleSerializer(metaclass=Final):
         ``deserialize_flat_apply_inputs`` reverses this.
         """
         func, in_spec, *flat_args = node.args
+        # Load reads a single list result as the list of the call's results.
+        result = node.meta.get("val")
+        if (
+            isinstance(result, tuple)
+            and len(result) == 1
+            and isinstance(result[0], list)
+        ):
+            raise SerializeError(
+                f"Cannot serialize flat_apply node {node.name}: load cannot read a "
+                "single result that is a list"
+            )
         owner = node.graph.owning_module
         func_spec, in_spec_value = (
             torch.fx.graph_module._get_attr(owner, arg.target)

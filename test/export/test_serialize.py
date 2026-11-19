@@ -3190,6 +3190,7 @@ class TestPredispatchSerialization(TestCase):
                 {flag},
                 frozenset({flag}),
                 deque([flag]),
+                deque([1], maxlen=1),
                 math.nan,
                 {math.nan},
             )
@@ -3411,7 +3412,9 @@ class TestPredispatchSerialization(TestCase):
     @parametrize(
         "replaced,name,reason",
         [
-            subtest(("function", "builtins.exec", "cannot be used"), name="exec"),
+            subtest(
+                ("function", "builtins.exec", "not a class or function"), name="exec"
+            ),
             subtest(
                 ("function", "torch.nn.parameter.Parameter", "cannot be used"),
                 name="parameter",
@@ -3432,7 +3435,7 @@ class TestPredispatchSerialization(TestCase):
             ),
             subtest(("function", "__mp_main__.f", "__main__ module"), name="mp_main"),
             subtest(
-                ("class", "builtins.exec", "is not a torch.autograd.Function"),
+                ("class", "builtins.exec", "not a class or function"),
                 name="class_exec",
             ),
             # Export only calls autograd functions whose apply allows it.
@@ -3528,6 +3531,7 @@ class TestPredispatchSerialization(TestCase):
             "name as the first input",
         ),
         "not_a_pair": (_set_in_spec(((0, 0), {}, 0)), "name as the first input"),
+        "outer_list": (_set_in_spec([(0, 0, 0), {}]), "name as the first input"),
         "args_empty": (
             _set_in_spec(((), {"a": 0, "b": 0, "c": 0})),
             "name as the first input",
@@ -3662,6 +3666,10 @@ class TestPredispatchSerialization(TestCase):
             "of kind as_operator",
         ),
         "leaf_count": (_drop_last_flat_input, "flat inputs, but its input spec"),
+        "list_result": (
+            lambda node: node.meta.update(val=([node.meta["val"]],)),
+            "single result that is a list",
+        ),
         "spec_not_attribute": (
             lambda node: node.update_arg(1, 0),
             "input spec to be TreeSpec graph attributes",
