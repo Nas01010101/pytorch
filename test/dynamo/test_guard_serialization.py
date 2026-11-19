@@ -3823,11 +3823,15 @@ class TestGuardSerialization(TestGuardSerializationBase):
         self._test_check_fn(ref, loaded, {"m": torch.nn.Module()}, False)
 
         # Check verbose_code_parts from leaf guards (they include hints)
+        checked = 0
+
         def check_leaf_guards(mgr):
+            nonlocal checked
             for guard in mgr.get_leaf_guards():
                 verbose_parts = guard.verbose_code_parts()
                 verbose_str = " ".join(verbose_parts)
-                if "___check_type_id" in verbose_str and "L['m']" in verbose_str:
+                if "___check_type_id(L['m']," in verbose_str:
+                    checked += 1
                     self.assertIn(
                         "HINT: type",
                         verbose_str,
@@ -3854,6 +3858,7 @@ class TestGuardSerialization(TestGuardSerializationBase):
                 check_leaf_guards(child_mgr)
 
         check_leaf_guards(ref.root)
+        self.assertGreater(checked, 0)
 
     def test_tensor_subclass_metadata_match(self):
         class LocalSubclass(torch.Tensor):
@@ -4263,6 +4268,8 @@ class TestGuardSerialization(TestGuardSerializationBase):
         class Local:
             pass
 
+        impostor = collections.namedtuple("Point", ["x"], module=__name__)
+        impostor.__qualname__ = _TupleOwner.Point.__qualname__
         cases = [
             (math, True),
             (math.sqrt, True),
@@ -4293,7 +4300,8 @@ class TestGuardSerialization(TestGuardSerializationBase):
             (Local, False),
             # Its __qualname__ leads to _wrapped_target instead.
             (_wraps_wrapper, False),
-            (_TupleOwner.Point, False),
+            (_TupleOwner.Point, True),
+            (impostor, False),
             # The guard-state pickler refuses a class with a nested metaclass.
             (_WithNestedMeta, False),
             # Bound to the module's Random instance, with no __module__.
@@ -4331,11 +4339,11 @@ class TestGuardSerialization(TestGuardSerializationBase):
                 return x
             return x + 1
 
-        # The guard-state pickler rebuilds a nested NamedTuple as a fresh class.
-        with self.assertRaisesRegex(
-            PackageError, "CLASS_MATCH guard cannot be serialized."
-        ):
-            self._test_serialization("CLASS_MATCH", fn, torch.randn(3))
+        x = torch.randn(3)
+        ref, loaded = self._test_serialization("CLASS_MATCH", fn, x)
+        self._test_check_fn(ref, loaded, {"x": x}, True)
+        with mock.patch.object(_TupleOwner, "Point", tuple):
+            self._test_check_fn(ref, loaded, {"x": x}, False)
 
     def test_guarded_user_object_prunes_unguarded_attributes(self):
         def fn(x, holder):
