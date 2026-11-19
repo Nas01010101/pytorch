@@ -919,6 +919,17 @@ def _namedtuple_deserialize(dumpable_context: DumpableContext) -> Context:
         )
 
     typ = SERIALIZED_TYPE_TO_PYTHON_TYPE[dumpable_context]
+    # treespec_dumps also writes classes registered with _register_namedtuple,
+    # which does not check that they are namedtuple classes.
+    registered = SUPPORTED_SERIALIZED_TYPES[typ].from_dumpable_context
+    if typ is namedtuple or not (
+        is_namedtuple_class(typ) or registered is _namedtuple_deserialize
+    ):
+        raise NotImplementedError(
+            f"Can't deserialize a namedtuple TreeSpec: its serialized name "
+            f"{dumpable_context} refers to {typ}, which is neither a namedtuple "
+            "class nor registered with `_register_namedtuple`."
+        )
     return typ
 
 

@@ -54,6 +54,14 @@ parametrize_pytree_module = parametrize(
 GlobalPoint = namedtuple("GlobalPoint", ["x", "y"])
 
 
+class GlobalPair(tuple):  # can be registered as a namedtuple, but is not one
+    __slots__ = ()
+    _fields = ("x", "y")
+
+    def __new__(cls, x, y):
+        return super().__new__(cls, (x, y))
+
+
 class GlobalDummyType:
     def __init__(self, x, y):
         self.x = x
@@ -1189,6 +1197,24 @@ if cxx_pytree.tree_leaves(foo) != [foo]:
             NotImplementedError, "Please register using `_register_namedtuple`"
         ):
             python_pytree.treespec_dumps(spec)
+
+    def test_pytree_deserialize_namedtuple_names_a_namedtuple(self):
+        import json
+
+        python_pytree._register_namedtuple(
+            GlobalPair,
+            serialized_type_name="test_pytree.test_pytree_deserialize_namedtuple_names_a_namedtuple.GlobalPair",
+        )
+        self.addCleanup(python_pytree._deregister_pytree_node, GlobalPair)
+        spec = python_pytree.tree_structure(GlobalPair(1, 2))
+        self.assertEqual(
+            python_pytree.treespec_loads(python_pytree.treespec_dumps(spec)), spec
+        )
+        names = ["collections.defaultdict", "builtins.tuple", "collections.namedtuple"]
+        node = {"type": "collections.namedtuple", "children_spec": []}
+        for name in names:
+            with self.assertRaisesRegex(NotImplementedError, "is neither a namedtuple"):
+                python_pytree.treespec_loads(json.dumps([1, {**node, "context": name}]))
 
     def test_pytree_custom_type_serialize_bad(self):
         class DummyType:
