@@ -1216,6 +1216,44 @@ if cxx_pytree.tree_leaves(foo) != [foo]:
             with self.assertRaisesRegex(NotImplementedError, "is neither a namedtuple"):
                 python_pytree.treespec_loads(json.dumps([1, {**node, "context": name}]))
 
+    @parametrize(
+        "value,reason",
+        [
+            subtest(
+                (([1], {"a": deque([2])}, OrderedDict(b=3), GlobalPoint(4, 5)), None),
+                name="plain",
+            ),
+            subtest(((0, {TestEnum.A: 0}), "module of an enum"), name="enum"),
+            subtest(
+                ((0, defaultdict(list, a=[0])), "module of a defaultdict factory"),
+                name="defaultdict",
+            ),
+        ],
+    )
+    def test_pytree_loads_without_imports(self, value, reason):
+        from unittest import mock
+
+        python_pytree._register_namedtuple(
+            GlobalPoint,
+            serialized_type_name="test_pytree.test_pytree_loads_without_imports.GlobalPoint",
+        )
+        self.addCleanup(python_pytree._deregister_pytree_node, GlobalPoint)
+        serialized = python_pytree.treespec_dumps(python_pytree.tree_structure(value))
+        spec = python_pytree.treespec_loads(serialized)
+        self.assertEqual(spec, python_pytree.tree_structure(value))
+        with mock.patch("importlib.import_module") as import_module:
+            if reason is None:
+                loaded = python_pytree._treespec_loads_without_imports(serialized)
+                self.assertEqual(loaded, spec)
+            else:
+                with self.assertRaisesRegex(ValueError, reason):
+                    python_pytree._treespec_loads_without_imports(serialized)
+        import_module.assert_not_called()
+
+    def test_pytree_loads_without_imports_unknown_protocol(self):
+        with self.assertRaisesRegex(ValueError, "Unknown protocol 2"):
+            python_pytree._treespec_loads_without_imports("[2, null]")
+
     def test_pytree_custom_type_serialize_bad(self):
         class DummyType:
             def __init__(self, x, y):
