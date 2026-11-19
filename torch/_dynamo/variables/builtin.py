@@ -3376,11 +3376,20 @@ class BuiltinVariable(BaseBuiltinVariable):
                 guard_type = arg.get_id_guard_type()
                 if guard_type is not None:
                     install_guard(arg.source.make_guard(guard_type))
-            return VariableTracker.build(tx, real_id)
+            result = VariableTracker.build(tx, real_id)
+        else:
+            from .builder import SourcelessBuilder
 
-        from .builder import SourcelessBuilder
-
-        return SourcelessBuilder.create_internal_fake_id(id(arg))
+            result = SourcelessBuilder.create_internal_fake_id(id(arg))
+        if (legacy := variables.functions._legacy_deepcopy) is not None and (
+            tx.f_globals is legacy.__globals__
+            or isinstance(arg, (ConstDictVariable, ListVariable))
+        ):
+            try:
+                tx.output.deepcopy_id_types[result] = arg.python_type()
+            except NotImplementedError:
+                pass
+        return result
 
     def call_deepcopy(
         self, tx: "InstructionTranslatorBase", x: VariableTracker
@@ -3745,13 +3754,13 @@ class DictBuiltinVariable(BaseBuiltinVariable):
             obj = args[0].realize()
             if isinstance(obj, ConstDictVariable):
                 obj.check_base_dict_mutation(tx, name)
-            if name == "__repr__":
+            if name in (*_RICH_CMP_DUNDERS, "__repr__", "__iter__"):
                 if not isinstance(obj, ConstDictVariable):
                     unimplemented(
                         gb_type="Unsupported builtin dictionary storage operation",
                         context=f"dict.{name} on {obj.python_type_name()}",
                         explanation="Dynamo cannot yet preserve builtin dictionary storage for this operation.",
-                        hints=[],
+                        hints=[*graph_break_hints.SUPPORTABLE],
                     )
                 # Explicit dict slots bypass OrderedDict's linked-order behavior.
                 slotdef = obj.lookup_slotdefs(name)

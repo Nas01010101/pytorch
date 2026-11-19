@@ -5412,25 +5412,52 @@ not ___dict_contains('cccccccc', G['sys'].modules)""",
             torch.compile(minimal, fullgraph=True, backend="eager")(x), minimal(x)
         )
 
-    @parametrize("copier", [copy.copy, copy.deepcopy])
+    def test_deepcopy_memo_with_local_hash(self):
+        class Key:
+            def __hash__(self):
+                return id(self)
+
+        @torch.compile(backend="eager", fullgraph=True)
+        def fn(x, mapping):
+            return x + len(copy.deepcopy(mapping, {hash(Key()): None}))
+
+        self.assertEqual(fn(torch.tensor(1), collections.OrderedDict(a=1)), 2)
+
+    def test_deepcopy_ordered_dict_nested_region_memo(self):
+        @torch.compiler.nested_compile_region
+        def region(x, mapping):
+            return x + len(copy.deepcopy(mapping))
+
+        fn = torch.compile(lambda x, m: region(x, m), backend="eager", fullgraph=True)
+        mapping = collections.OrderedDict(a={1}, b=([],), c=1)
+        self.assertEqual(fn(torch.tensor(1), mapping), 4)
+
+    @parametrize(
+        "copier", [copy.copy, copy.deepcopy, lambda od: copy.deepcopy([od], {17: 3})[0]]
+    )
     def test_ordered_dict_copy_input_order(self, copier):
         def fn(x, od):
-            return x + (next(iter(copier(od))) == "first key")
+            key = next(reversed(copier(od)))
+            return x + (key == "first key"), key
 
         counter = CompileCounter()
         compiled = torch.compile(fn, backend=counter, fullgraph=True)
         x = torch.tensor(10)
-        original = collections.OrderedDict.fromkeys(["".join(["first", " key"]), "b"])
+        value = [1]
+        original = collections.OrderedDict(b=value)
+        original[b"first key".decode()] = None
         equal_key = "".join(["first", " key"])
-        self.assertIsNot(next(iter(original)), equal_key)
+        self.assertIsNot(next(reversed(original)), equal_key)
         self.assertEqual(compiled(x, original), fn(x, original))
         original.clear()
-        original.update([(equal_key, None), ("b", None)])
-        self.assertEqual(compiled(x, original), fn(x, original))
+        original.update([("b", value), (equal_key, None)])
+        result = compiled(x, original)
+        self.assertEqual(result, fn(x, original))
+        self.assertIs(result[1], equal_key)
         self.assertEqual(counter.frame_count, 1)
         reversed_input = collections.OrderedDict(reversed(list(original.items())))
         self.assertEqual(compiled(x, reversed_input), fn(x, reversed_input))
-        original.move_to_end(equal_key)
+        original.move_to_end(equal_key, last=False)
         self.assertEqual(compiled(x, original), fn(x, original))
 
     @parametrize("copier", [copy.copy, copy.deepcopy])
