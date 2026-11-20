@@ -252,7 +252,7 @@ def mx_swizzle_for(device, mat_dtype) -> SwizzleType:
     instead of relying on `infer_scale_swizzle`, whose element counts do not
     distinguish the two where their paddings coincide.
     """
-    if not torch.version.hip and "xpu" not in device:
+    if not torch.version.hip and "xpu" not in device and "mps" not in device:
         return SwizzleType.SWIZZLE_32_4_4
     if torch.version.hip and evaluate_gfx_arch_within(["gfx1250"]) and rocm_mx_swizzle(mat_dtype):
         return SwizzleType.SWIZZLE_128
@@ -2629,7 +2629,6 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         self.assertEqual(out_fp32, out_fp8.to(torch.float))
 
     @onlyAccelerator
-    @skipMPS
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM, mx_skip_msg)
     @parametrize("mkn", [
         # Nice shapes
@@ -2701,7 +2700,6 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
             raise AssertionError(f"sqnr {sqnr.item()} should be > {approx_match_sqnr_target}")
 
     @onlyAccelerator
-    @skipMPS
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM, mx_skip_msg)
     @parametrize("test_case_name", [
         "a_eye_b_eye",
@@ -2760,6 +2758,10 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         lambda p: 'xpu' in p['device'] and p['recipe'] == 'nvfp4' and (not Xe2_Or_Later),
     )
     @decorateIf(
+        unittest.skip('MXFP4 is not supported on MPS'),
+        lambda p: 'mps' in p['device'] and p['recipe'] == 'mxfp4',
+    )
+    @decorateIf(
         unittest.skip('K must be divisible by 32 for nvfp4 cublas gemm, skipping'),
         lambda p: p['recipe'] == 'nvfp4' and p['mkn'][1] % 32 != 0,
     )
@@ -2787,6 +2789,8 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
                 raise unittest.SkipTest("fast_accum not supported on XPU, skipping")
             if recipe == "nvfp4" and not Xe2_Or_Later:
                 raise unittest.SkipTest("NVFP4 numerics require Xe2+ on XPU")
+        if "mps" in device and recipe == "mxfp4":
+            raise unittest.SkipTest("MXFP4 is not supported on MPS")
         M, K, N = mkn
         if recipe == "nvfp4" and K % 32 != 0:
             raise unittest.SkipTest("K must be divisible by 32 for nvfp4 cublas gemm, skipping")
@@ -2992,7 +2996,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         C_ref = A_ref @ B_ref.t()
 
         # convert to swizzled format
-        if rocm_mx_swizzle(A.dtype) or (not torch.version.hip and "xpu" not in device):
+        if rocm_mx_swizzle(A.dtype) or (not torch.version.hip and "xpu" not in device and "mps" not in device):
             A_scale = mx_scale_swizzle(A_scale, A.dtype, BLOCK_SIZE)
             B_scale = mx_scale_swizzle(B_scale, B.dtype, BLOCK_SIZE)
 
@@ -3365,11 +3369,17 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         unittest.skip('MXFP4 on CUDA only supported on B200/B300'),
         lambda p: p['recipe'] == 'mxfp4' and IS_SM12X,
     )
+    @decorateIf(
+        unittest.skip('MXFP4 is not supported on MPS'),
+        lambda p: 'mps' in p['device'] and p['recipe'] == 'mxfp4',
+    )
     def test_blockwise_nvfp4_mxfp4_compile(self, device, recipe) -> None:
         if recipe == "nvfp4" and torch.version.hip and not rocm_nvfp4_supported():
             raise unittest.SkipTest("nvfp4 on ROCm requires gfx1250 and ROCm 10.0, skipping")
         if recipe == "mxfp4" and IS_SM12X:
             raise unittest.SkipTest("MXFP4 on CUDA only supported on B200/B300")
+        if "mps" in device and recipe == "mxfp4":
+            raise unittest.SkipTest("MXFP4 is not supported on MPS")
 
         M, K, N = 128, 128, 128
         BLOCK_SIZE = 16 if recipe == "nvfp4" else 32
