@@ -27,6 +27,13 @@ sink_waits_iterative_debug_limit_to_sink: int | None = (
 # Should be used with config.runtime_estimations_mms_benchmark = True
 reorder_iterative_use_runtime_estimations: bool = False
 sink_iterative_use_runtime_estimations: bool = False
+# Sink waits: count the time a collective queues behind earlier collectives on
+# the same process group (they run FIFO on one stream) as exposed comm time.
+sink_iterative_queue_aware_estimations: bool = False
+# Reorder: keep hoisting a collective while its process group's stream would sit
+# idle before it, even if its communication is already fully hidden by compute,
+# since a late issue delays every collective queued after it.
+reorder_iterative_queue_aware_estimations: bool = False
 
 # Broadcast runtime estimations doing real Collective operation between all ranks.
 # If non-deterministic runtime estimations are used this must be used to make

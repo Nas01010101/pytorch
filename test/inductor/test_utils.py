@@ -22,6 +22,7 @@ from torch._dynamo.exc import TritonUnavailableError
 from torch._dynamo.source import ConstantSource
 from torch._dynamo.testing import AotEagerAndRecordGraphs
 from torch._dynamo.utils import detect_fake_mode
+from torch._inductor import comms, ir
 from torch._inductor import config as inductor_config, utils as inductor_utils
 from torch._inductor.analysis.device_info import (
     _device_mapping,
@@ -29,6 +30,7 @@ from torch._inductor.analysis.device_info import (
     register_device_info,
 )
 from torch._inductor.compile_fx import _get_subgraph_names
+from torch._inductor.dependencies import StarDep
 from torch._inductor.fx_utils import (
     _is_fake_tensor_same,
     count_flops_fx,
@@ -39,6 +41,7 @@ from torch._inductor.fx_utils import (
     get_node_storage,
     get_storage,
 )
+from torch._inductor.scheduler import BaseSchedulerNode, GroupedSchedulerNode
 from torch._inductor.utils import (
     _get_device_dram_gbps,
     _get_device_info_key,
@@ -3613,6 +3616,168 @@ class TestScaleSwizzleInference(TestCase):
         self.assertEqual(
             self._infer(mat_size, (1024,), mat_dtype, prefers_32_8=False), (None, None)
         )
+
+
+@instantiate_parametrized_tests
+class TestCollectiveQueueTimeline(TestCase):
+    @staticmethod
+    def _scheduler_node(name, kernel, dependencies=()):
+        if type(kernel) is ir._WaitKernel:
+            kernel.op_overload = torch.ops._c10d_functional.wait_tensor.default
+            kernel.python_kernel_name = None
+        snode = mock.Mock(spec=BaseSchedulerNode)
+        snode.node = kernel
+        snode.get_name.return_value = name
+        output = mock.Mock()
+        output.get_name.return_value = name
+        snode.get_outputs.return_value = [output]
+        snode.unmet_dependencies = {StarDep(dep, mode=None) for dep in dependencies}
+        return snode
+
+    @staticmethod
+    def _collective(
+        name, args, kwargs=None,
+        schema="test::collective(Tensor input, str group_name, str strategy) -> Tensor",
+    ):
+        kwargs = {} if kwargs is None else kwargs
+        kernel = object.__new__(ir._CollectiveKernel)
+        kernel.inputs = [mock.sentinel.input]
+        kernel.constant_args = [*args[1:], *kwargs.values()]
+        kernel.op_overload = types.SimpleNamespace(_schema=torch._C.parse_schema(schema))
+        kernel.unflatten_args = mock.Mock(return_value=(args, kwargs))
+        return TestCollectiveQueueTimeline._scheduler_node(name, kernel)
+
+    @staticmethod
+    def _group(nodes):
+        group = object.__new__(GroupedSchedulerNode)
+        group.snodes = nodes
+        group.temp_grouping = True
+        return group
+
+    @staticmethod
+    def _timeline(nodes):
+        next_dict = {
+            node: nodes[index + 1] if index + 1 < len(nodes) else None
+            for index, node in enumerate(nodes)
+        }
+        return comms._collective_queue_timeline(
+            nodes[0], next_dict, dict.fromkeys(nodes, 4.0)
+        )
+
+    @parametrize("keyword", [False, True])
+    def test_group_name_uses_schema(self, keyword):
+        args = [mock.sentinel.input, "pg0", "not_a_group"]
+        kwargs = {}
+        if keyword:
+            args = [mock.sentinel.input]
+            kwargs = {"group_name": "pg0", "strategy": "not_a_group"}
+        snode = self._collective("op0", args, kwargs)
+        self.assertEqual(comms._collective_process_group_name(snode), "pg0")
+
+    def test_group_name_from_handle_metadata(self):
+        group = types.SimpleNamespace(group_name="pg0")
+        snode = self._collective(
+            "op0", [mock.sentinel.input, group, "not_a_group"],
+            schema="test::collective(Tensor input, Any group_name, str strategy) -> Tensor",
+        )
+        self.assertEqual(comms._collective_process_group_name(snode), "pg0")
+
+    @parametrize("group_name", [None, "", 17])
+    def test_reject_unresolved_group_name(self, group_name):
+        snode = self._collective("op0", [mock.sentinel.input, group_name, "not_a_group"])
+        with self.assertRaisesRegex(AssertionError, "non-empty process-group name"):
+            comms._collective_process_group_name(snode)
+
+    def test_reject_missing_group_argument(self):
+        snode = self._collective("op0", [mock.sentinel.input])
+        with self.assertRaisesRegex(AssertionError, "non-empty process-group name"):
+            comms._collective_process_group_name(snode)
+
+    def test_reject_missing_group_schema(self):
+        snode = self._collective(
+            "op0", [mock.sentinel.input, "not_a_group"],
+            schema="test::collective(Tensor input, str strategy) -> Tensor",
+        )
+        with self.assertRaisesRegex(AssertionError, "group_name schema argument"):
+            comms._collective_process_group_name(snode)
+
+    def test_distinct_process_groups_do_not_queue(self):
+        first = self._collective("op0", [mock.sentinel.input, "pg0", "same_strategy"])
+        second = self._collective("op1", [mock.sentinel.input, "pg1", "same_strategy"])
+        delays, idle = self._timeline([first, second])
+        self.assertEqual(delays, {first: 0.0, second: 0.0})
+        self.assertEqual(idle, {first: 0.0, second: 0.0})
+
+    def test_same_process_group_queues(self):
+        first = self._collective("op0", [mock.sentinel.input, "pg0", "strategy0"])
+        second = self._collective("op1", [mock.sentinel.input, "pg0", "strategy1"])
+        delays, idle = self._timeline([first, second])
+        self.assertEqual(delays, {first: 0.0, second: 4.0})
+        self.assertEqual(idle, {first: 0.0, second: 0.0})
+
+    def test_same_process_group_wrapper(self):
+        first = self._collective("op0", [mock.sentinel.input, "pg0", "strategy0"])
+        second = self._collective("op1", [mock.sentinel.input, "pg0", "strategy1"])
+        group = self._group([first, second])
+        delays, idle = self._timeline([group])
+        self.assertEqual(delays, {group: 0.0})
+        self.assertEqual(idle, {group: 0.0})
+
+    @parametrize("queue_aware", [False, True])
+    def test_sink_wait_multi_hop_refreshes_queue_delays(self, queue_aware):
+        a = self._collective("a", [mock.sentinel.input, "pg0", "strategy"])
+        b = self._collective("b", [mock.sentinel.input, "pg0", "strategy"])
+        wa = self._scheduler_node("wa", object.__new__(ir._WaitKernel), ["a"])
+        wb = self._scheduler_node("wb", object.__new__(ir._WaitKernel), ["b"])
+        prelude = self._scheduler_node("prelude", object())
+        consumer = self._scheduler_node("consumer", object(), ["wa"])
+        extra = self._scheduler_node("extra", object())
+        nodes = [a, prelude, wa, consumer, b, extra, wb]
+        runtimes = dict(zip(nodes, [19.0, 10.0, 0.0, 5.0, 1.0, 5.0, 0.0]))
+        memory = (
+            0, dict.fromkeys(nodes, (0, 0)),
+            {node: types.SimpleNamespace(size_alloc=0, size_free=0) for node in nodes},
+            {}, {}, {},
+        )
+        settings = {
+            "sink_iterative_queue_aware_estimations": queue_aware,
+            "sink_iterative_use_runtime_estimations": True,
+            "sink_iterative_extra_comm_comp_overlap": 0.0,
+            "sink_iterative_peak_memory_budget": 0.0,
+            "sink_waits_iterative_swap_with_collectives": True,
+            "sink_waits_iterative_unsafe_collectives_reorder": False,
+            "sink_waits_iterative_debug_limit_to_sink": None,
+            "reorder_iterative_debug_memory_recompute": False,
+            "reorder_sink_verbose_logging": False,
+        }
+        patches = {
+            "V": types.SimpleNamespace(graph=types.SimpleNamespace(
+                graph_inputs={}, get_output_names=lambda: [])),
+            "_initialize_memory_tracking": mock.Mock(return_value=memory),
+            "estimate_op_runtime": mock.Mock(side_effect=runtimes.__getitem__),
+            "_op_runtime_estimate_mult": mock.Mock(return_value=1.0),
+            "_find_buffers_with_changed_last_use_sink_waits": mock.Mock(return_value={}),
+            "_calculate_potential_peak_memory_sink_waits": mock.Mock(return_value=(0, {}, {})),
+            "_update_memory_tracking_after_swap_sink_waits": mock.Mock(),
+        }
+        with (
+            comms.config_comms.patch(settings),
+            mock.patch.multiple(comms, **patches),
+            mock.patch.object(comms, "_collective_queue_timeline",
+                              wraps=comms._collective_queue_timeline) as timeline,
+        ):
+            result, stats = comms._sink_waits_iterative_internal(nodes)
+        tail = [wa, consumer, wb] if queue_aware else [wb, wa, consumer]
+        self.assertEqual(result, [a, prelude, b, extra, *tail])
+        self.assertEqual(stats[wa].moves, 2 if queue_aware else 3)
+        self.assertEqual(timeline.call_count, 3 if queue_aware else 0)
+
+    def test_reject_mixed_process_group_wrapper(self):
+        first = self._collective("op0", [mock.sentinel.input, "pg0", "strategy0"])
+        second = self._collective("op1", [mock.sentinel.input, "pg1", "strategy1"])
+        group = self._group([first, second])
+        with self.assertRaisesRegex(AssertionError, "single process group"):
+            self._timeline([group])
 
 
 if __name__ == "__main__":

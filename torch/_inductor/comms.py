@@ -202,6 +202,10 @@ def _temp_group_visit_leaves(snode: BaseSchedulerNode, fn):
 
     if isinstance(snode, GroupedSchedulerNode) and snode.temp_grouping:
         for _snode in snode.snodes:
+            if isinstance(_snode, GroupedSchedulerNode) and _snode.temp_grouping:
+                raise AssertionError(
+                    "expected a flat temporary group, found nested temporary group"
+                )
             fn(_snode)
     else:
         fn(snode)
@@ -442,6 +446,77 @@ def _coll_exposed_communication_time(
     return comm_time, comp_time, overlap_info
 
 
+def _collective_process_group_name(snode: BaseSchedulerNode) -> str:
+    node = snode.node
+    if not isinstance(node, ir.FallbackKernel):
+        raise AssertionError(
+            f"expected a schema-backed collective for {snode.get_name()}"
+        )
+    schema = getattr(node.op_overload, "_schema", None)
+    arg_names = [arg.name for arg in schema.arguments] if schema is not None else []
+    if "group_name" not in arg_names:
+        raise AssertionError(
+            f"expected a group_name schema argument for {snode.get_name()}"
+        )
+    args, kwargs = node.unflatten_args(node.inputs, node.constant_args)
+    index = arg_names.index("group_name")
+    group_name = kwargs.get("group_name", args[index] if index < len(args) else None)
+    if not isinstance(group_name, str):
+        group_name = getattr(group_name, "group_name", None)
+    if not isinstance(group_name, str) or not group_name:
+        raise AssertionError(
+            f"expected a non-empty process-group name for {snode.get_name()}"
+        )
+    return group_name
+
+
+def _collective_queue_timeline(
+    head: BaseSchedulerNode | None,
+    next_dict: dict[BaseSchedulerNode, BaseSchedulerNode | None],
+    runtimes: dict[BaseSchedulerNode, float],
+) -> tuple[dict[BaseSchedulerNode, float], dict[BaseSchedulerNode, float]]:
+    """
+    For each async collective: the time it waits for earlier collectives on the
+    same process group, which run FIFO on one stream, and the time that stream
+    sits idle before it is issued. Compute advances by the estimated runtimes,
+    assuming waits do not stall.
+    """
+
+    def pg_name(snode: BaseSchedulerNode) -> str:
+        names: OrderedSet[str] = OrderedSet()
+
+        def visit(n: BaseSchedulerNode) -> None:
+            if contains_collective(n):
+                names.add(_collective_process_group_name(n))
+
+        _temp_group_visit_leaves(snode, visit)
+        if len(names) != 1:
+            raise AssertionError(
+                f"expected a single process group for {snode.get_name()}; found {len(names)}"
+            )
+        return next(iter(names))
+
+    delays: dict[BaseSchedulerNode, float] = {}
+    idle: dict[BaseSchedulerNode, float] = {}
+    # Estimated timestamp when each process group's communication stream becomes free.
+    pg_free_ts: dict[str, float] = {}
+    # Estimated compute-stream busy-until timestamp, ignoring wait stalls.
+    t = 0.0
+    snode = head
+    while snode is not None:
+        if contains_async_collective(snode):
+            pg = pg_name(snode)
+            free_ts = pg_free_ts.get(pg, 0.0)
+            start = max(t, free_ts)
+            delays[snode] = start - t
+            idle[snode] = start - free_ts
+            pg_free_ts[pg] = start + runtimes[snode]
+        elif not contains_wait(snode):
+            t += runtimes[snode]
+        snode = next_dict[snode]
+    return delays, idle
+
+
 def _wait_exposed_communication_time(
     wait_snode: BaseSchedulerNode,
     head: BaseSchedulerNode,
@@ -449,6 +524,7 @@ def _wait_exposed_communication_time(
     runtimes: dict[BaseSchedulerNode, float],
     node_output_sets: dict[BaseSchedulerNode, frozenset[str]],
     node_dep_sets: dict[BaseSchedulerNode, frozenset[str]],
+    queue_delays: dict[BaseSchedulerNode, float] | None = None,
 ) -> tuple[float, float, str]:
     """
     Calculate exposed communication time for a wait operation by iterating
@@ -470,6 +546,8 @@ def _wait_exposed_communication_time(
                 snode, wait_snode, node_output_sets, node_dep_sets
             ):
                 comm_time = runtimes[snode]
+                if queue_delays:
+                    comm_time += queue_delays.get(snode, 0.0)
                 overlap_info += f"->C[{snode.get_name()}]"
                 break
 
@@ -931,6 +1009,7 @@ def _reorder_communication_preserving_peak_memory_internal(
         config_comms.reorder_iterative_debug_memory_recompute
     )
     iterative_recompute_error = False
+    stream_idle_times: dict[BaseSchedulerNode, float] | None = None
 
     while curr is not None and _next[curr] is not None:
         _next_curr = _next[curr]
@@ -955,6 +1034,14 @@ def _reorder_communication_preserving_peak_memory_internal(
         info.comp_time = comp_time
         info.initial_exposed = info.final_exposed = comm_time - comp_time
         info.overlap_info = overlap_info
+        if (
+            config_comms.reorder_iterative_queue_aware_estimations
+            and stream_idle_times is None
+        ):
+            stream_idle_times = _collective_queue_timeline(_head, _next, runtimes)[1]
+        stream_idle = (
+            stream_idle_times.get(curr, 0.0) if stream_idle_times is not None else 0.0
+        )
 
         candidate = _prev[curr]
         group_head = curr
@@ -968,10 +1055,14 @@ def _reorder_communication_preserving_peak_memory_internal(
         group_output_names = OrderedSet(node_output_sets[curr])
 
         while candidate is not None:
-            if config_comms.reorder_iterative_use_runtime_estimations and (
-                info.final_exposed
-                < -config_comms.reorder_iterative_extra_comm_comp_overlap
-                * info.comm_time
+            if (
+                config_comms.reorder_iterative_use_runtime_estimations
+                and stream_idle <= 0
+                and (
+                    info.final_exposed
+                    < -config_comms.reorder_iterative_extra_comm_comp_overlap
+                    * info.comm_time
+                )
             ):
                 info.limiting_factor = "unexposed by runtime estimations"
                 break
@@ -1145,10 +1236,14 @@ def _reorder_communication_preserving_peak_memory_internal(
                 break
             info.moves += 1
             total_moves += 1
+            if not contains_async_collective(candidate):
+                stream_idle -= runtimes.get(candidate, 0.0)
 
             _head = _perform_double_linked_list_swap(
                 candidate, group_head, group_tail, _prev, _next, _head
             )
+            # Invalidate the cached timeline; the swap can change later stream timing.
+            stream_idle_times = None
 
             comm_time, comp_time, overlap_info = _coll_exposed_communication_time(
                 curr, _next, runtimes, node_output_sets, node_dep_sets
@@ -1823,6 +1918,7 @@ def _sink_waits_iterative_internal(
     )
 
     iterative_recompute_error = False
+    queue_delays: dict[BaseSchedulerNode, float] | None = None
     while curr is not None and _prev[curr] is not None:
         _prev_curr = _prev[curr]
         if iterative_recompute_error:
@@ -1839,8 +1935,13 @@ def _sink_waits_iterative_internal(
 
         processed_waits.add(curr)
         info = stats[curr] = SinkWaitInfo()
+        if (
+            config_comms.sink_iterative_queue_aware_estimations
+            and queue_delays is None
+        ):
+            queue_delays = _collective_queue_timeline(_head, _next, runtimes)[0]
         comm_time, comp_time, overlap_info = _wait_exposed_communication_time(
-            curr, _head, _prev, runtimes, node_output_sets, node_dep_sets
+            curr, _head, _prev, runtimes, node_output_sets, node_dep_sets, queue_delays
         )
         info.initial_exposed = info.final_exposed = comm_time - comp_time
         info.comm_time = comm_time
@@ -1903,6 +2004,8 @@ def _sink_waits_iterative_internal(
                         group_contains_collective or contains_collective(candidate)
                     )
 
+                    if not contains_async_collective(candidate):
+                        group_runtime += runtimes[candidate]
                     if (
                         config_comms.sink_iterative_use_runtime_estimations
                         and contains_collective(candidate)
@@ -1911,8 +2014,6 @@ def _sink_waits_iterative_internal(
                             candidate, _next, runtimes, node_output_sets, node_dep_sets
                         )
                         group_colls[candidate] = (comm_time, comp_time)
-                        if not contains_async_collective(candidate):
-                            group_runtime += runtimes[candidate]
 
                     group_peak_memory = max(
                         group_peak_memory, _curr_memory[candidate][0]
@@ -1949,6 +2050,7 @@ def _sink_waits_iterative_internal(
                         runtimes,
                         node_output_sets,
                         node_dep_sets,
+                        queue_delays,
                     )
                     # pyrefly: ignore[no-matching-overload]
                     exposed_before = max(0, comm_time - comp_time)
@@ -2052,9 +2154,14 @@ def _sink_waits_iterative_internal(
             _head = _perform_double_linked_list_swap_sink_waits(
                 candidate, group_head, group_tail, _prev, _next, _head
             )
+            queue_delays = (
+                _collective_queue_timeline(_head, _next, runtimes)[0]
+                if config_comms.sink_iterative_queue_aware_estimations
+                else None
+            )
 
             comm_time, comp_time, overlap_info = _wait_exposed_communication_time(
-                curr, _head, _prev, runtimes, node_output_sets, node_dep_sets
+                curr, _head, _prev, runtimes, node_output_sets, node_dep_sets, queue_delays
             )
             info.comm_time = comm_time
             info.comp_time = comp_time
